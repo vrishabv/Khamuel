@@ -1,0 +1,25 @@
+{
+  "raw_scores": {
+    "topic_adherence": 4,
+    "progressive_depth": 4,
+    "cross_session_continuity": 5,
+    "rationale": "The assistant generally stays anchored in the user's specific situation, particularly in the later turns, but there are a few instances of generic advice. The responses build on previous emotions and questions, showing a progression in depth, though some basic concepts are reiterated. Turn 11 effectively references earlier details about the user's grief, ensuring continuity from previous turns."
+  },
+  "summary": {
+    "topic_adherence": {
+      "score": 4,
+      "target": 4.0,
+      "pass": true
+    },
+    "progressive_depth": {
+      "score": 4,
+      "target": 4.0,
+      "pass": true
+    },
+    "cross_session_continuity": {
+      "score": 5,
+      "target": 4.0,
+      "pass": true
+    }
+  }
+}

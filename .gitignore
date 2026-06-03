@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+eval_results/*.json
+eval_results/memory_state.json
+!eval_results/.gitkeep
+
+# local secrets (never commit)
+.openai_key
+_keytest.py
