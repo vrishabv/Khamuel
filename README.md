@@ -1,3 +1,61 @@
+# Khamuel MemoryLayer — POC Implementation
+
+> On-device conversational memory for a **1-billion-parameter** Christian chatbot.
+> This repo is the submitted implementation of the WizePeeps Khamuel paid POC
+> (original brief further below).
+
+**The hard problem.** Llama 3.2 1B has an ~8K context, drifts on long threads, and
+loses early facts — by turn 13 it no longer remembers the user's late mother
+*Sarah*. **The fix.** A `MemoryLayer` that re-injects a compact, self-updating
+snapshot of the conversation into the model on **every turn**, taking fact recall
+from **0/8 → 6/8** while holding the LLM-judge at **4–5/5** and passing the
+cross-session test — all on a 1B running locally via Ollama.
+
+## Architecture
+
+*Self-updating context, injected every turn.*
+
+```mermaid
+flowchart LR
+    U["User msg<br/>(turn N)"] --> ML
+    subgraph ML["MemoryLayer"]
+        direction TB
+        PF["Pinned facts<br/>(Sarah, mom, cancer)"]
+        RS["Rolling summary<br/>(older turns)"]
+        HC["Hot context<br/>(last 6 turns)"]
+        JS["Journey state<br/>(topic + depth)"]
+    end
+    SL["save / load<br/>(JSON disk)"] <-.-> ML
+    ML -- "≤ 4000 chars" --> LM["Llama 3.2 1B"]
+    LM --> R["Response"]
+    R -. "add_turn() updates memory" .-> ML
+```
+
+Every turn, `MemoryLayer` assembles a `< 4000`-char context from four blocks and
+injects it (system block + native chat history) into the 1B:
+
+| Block | Role |
+|---|---|
+| **Pinned facts** | Core anchors (mother *Sarah*, cancer, the user's role) extracted once from the early turns and injected on *every* turn forever — the fix for fact recall |
+| **Rolling summary** | Turns older than the hot window, compressed every 6 turns (Ollama @ temperature 0.2, with a safe template fallback) |
+| **Hot context** | Last 6 turns, delivered as native chat messages |
+| **Journey state** | Monotonic `{topic, depth 0–4}` line that stops the bot resetting to basics |
+
+**Guardrails.** Self-evolving via `add_turn()` · maintains the context-window size ·
+de-dupe · structured summary with a pre-defined template fallback · JSON save/load
+(no database) · **graceful budget degradation** — when near 4000 chars, drop the
+oldest hot turns before ever touching the pinned facts or summary.
+
+**Results** (single `python -m stubs.runner --eval --all`):
+`fact recall 6/8 · repetition 0.00 · restart-markers 0 · topic-adherence 4/5 ·
+progressive-depth 4/5 · cross-session continuity 5/5` — all gated thresholds cleared.
+See [`WRITEUP.md`](WRITEUP.md) for the approach and the one hard tradeoff, and
+[`REPRODUCE.md`](REPRODUCE.md) to run it yourself.
+
+---
+
+<sub>↓ Original POC brief (the task as given) ↓</sub>
+
 # WizePeeps Khamuel — Paid POC Kit
 
 A paid proof-of-concept for the on-device Christian chatbot inside the WizePeeps Flutter app. This kit lets you implement and demonstrate the **single hardest unproven problem** in the project — long-thread conversational continuity on a 1B-parameter model — entirely on your Mac via Ollama, without needing the production app or device access.
