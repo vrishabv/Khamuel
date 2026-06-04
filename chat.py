@@ -1,8 +1,9 @@
 """Chat with Khamuel in your terminal.
 
-  python chat.py            # free chat in Khamuel's voice (remembers this session)
-  python chat.py --memory   # use the graded MemoryLayer (it's tuned for the grief
-                            # scenario, so it will lean toward "your mother Sarah")
+  python chat.py                          # free chat in Khamuel's voice (remembers this session)
+  python chat.py --memory                 # use the graded MemoryLayer (it's tuned for the grief
+                                           # scenario, so it will lean toward "your mother Sarah")
+  python chat.py --memory --model gemma3:1b  # same, but drive a different Ollama model
 
 Type a message and press Enter. Type 'quit' (or 'q') to leave.
 """
@@ -10,14 +11,27 @@ import sys
 
 import ollama
 
+import stubs.memory as memory_module
 from stubs.runner import MODEL, SYSTEM_PROMPT, DEFAULT_OPTIONS, process_turn
 from stubs.memory import MemoryLayer
 
 
+def _arg_value(flag: str, default: str) -> str:
+    """Read `--flag value` from argv, else return default."""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
 def main() -> None:
     use_layer = "--memory" in sys.argv
+    model = _arg_value("--model", MODEL)
+    # Keep the rolling-summary model in sync with the chat model (mirrors runner).
+    memory_module.SUMMARY_MODEL = model
     mode = "memory layer (grief-tuned)" if use_layer else "free chat"
-    print(f"Khamuel is here.  [mode: {mode}]")
+    print(f"Khamuel is here.  [mode: {mode}]  [model: {model}]")
     print("Type a message, or 'quit' to leave.\n")
 
     # For interactive chat, let replies finish (the kit caps eval replies at 220
@@ -40,10 +54,10 @@ def main() -> None:
             break
 
         if use_layer:
-            reply = process_turn(user, memory=memory)["response"]
+            reply = process_turn(user, memory=memory, model=model)["response"]
         else:
             history.append({"role": "user", "content": user})
-            resp = ollama.chat(model=MODEL, messages=history, options=DEFAULT_OPTIONS)
+            resp = ollama.chat(model=model, messages=history, options=DEFAULT_OPTIONS)
             reply = resp["message"]["content"].strip()
             history.append({"role": "assistant", "content": reply})
 
