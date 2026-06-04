@@ -17,4 +17,5 @@ eval_results/grief_20turn_gemma*.json
 # local experiment scratch (logs, helper scripts, backups)
 _*.log
 _*.ps1
+_*.py
 _*_backup/

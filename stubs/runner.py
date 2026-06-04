@@ -40,7 +40,7 @@ SYSTEM_PROMPT = (
 DEFAULT_OPTIONS = {
     "temperature": 0.4,
     "top_p": 0.9,
-    "num_predict": 220,  # roughly 3-4 sentences for Khamuel's voice
+    "num_predict": 384,  # was 220; raised to stop mid-sentence truncation of replies
 }
 
 
