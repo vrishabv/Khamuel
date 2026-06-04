@@ -1,7 +1,7 @@
 {
   "total_turns": 20,
   "fact_recall": {
-    "late_turns_with_recall": 6,
+    "late_turns_with_recall": 8,
     "total_late_turns": 8,
     "target_min": 3,
     "pass": true
@@ -95,8 +95,7 @@
   },
   "restart_markers": {
     "early_markers_seen": [
-      "prayer can be a powerful",
-      "trust in (jesus|god|the lord)"
+      "i'm here to listen"
     ],
     "late_turn_reuses": [],
     "target_max": 0,

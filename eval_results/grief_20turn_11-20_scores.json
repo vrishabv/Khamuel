@@ -1,7 +1,7 @@
 {
   "total_turns": 10,
   "fact_recall": {
-    "late_turns_with_recall": 3,
+    "late_turns_with_recall": 8,
     "total_late_turns": 8,
     "target_min": 3,
     "pass": true

@@ -1,9 +1,9 @@
 {
   "raw_scores": {
     "topic_adherence": 5,
-    "progressive_depth": 4,
+    "progressive_depth": 5,
     "cross_session_continuity": 5,
-    "rationale": "The assistant consistently references the user's specific situation regarding Sarah's death and the user's role as a working parent, providing tailored advice throughout the conversation. While most responses build on previous discussions, there is a minor restart in TURN 13 when the assistant shifts to practical steps without fully integrating the user's expressed feelings. TURN 11 effectively references earlier details, ensuring continuity in the conversation."
+    "rationale": "The assistant consistently references the user's specific situation regarding their mother Sarah and their grief throughout the conversation. Each response builds on the previous emotional context, providing deeper insights and practical steps without reverting to generic advice. Turn 11 explicitly acknowledges the user's earlier feelings and context, maintaining continuity and relevance in the conversation."
   },
   "summary": {
     "topic_adherence": {
@@ -12,7 +12,7 @@
       "pass": true
     },
     "progressive_depth": {
-      "score": 4,
+      "score": 5,
       "target": 4.0,
       "pass": true
     },

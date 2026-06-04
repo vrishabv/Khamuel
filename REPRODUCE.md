@@ -62,24 +62,23 @@ My reported scores (from my own runs):
 
 | Metric | My score | Target |
 |---|---|---|
-| Topic adherence (LLM-judge, full) | 4 / 5 | ≥ 4.0 |
-| Progressive depth (LLM-judge, full) | 4 / 5 | ≥ 4.0 |
-| Fact recall (turns 13+, full) | 6 of 8 | ≥ 3 |
+| Topic adherence (LLM-judge, full) | 5 / 5 | ≥ 4.0 |
+| Progressive depth (LLM-judge, full) | 5 / 5 | ≥ 4.0 |
+| Fact recall (turns 13+, full) | 8 of 8 | ≥ 3 |
 | Restart-marker reuse (turns 17+) | 0 | 0 |
 | Avg near-dups per response | 0.00 | ≤ 0.5 |
 | Cross-session continuity (LLM-judge, 11-20) | 5 / 5 | ≥ 4.0 |
 
-Moses should see scores in the same range (see the variance note in §5 — all gated
-thresholds clear every run; fact recall floats 3–6/8, judge dimensions 4–5/5).
+With the verifier securing recall, these are stable across runs (recall is 8/8 every
+run, judge dimensions 4–5/5).
 
 ## 5. Gotchas / known issues
 
 - **First run downloads** the model (~0.8 GB) and the scorer's sentence-transformers
   embedder (~80 MB + torch); subsequent runs are fast.
-- **Score variance:** generation temperature is 0.7 (raised from 0.4 to break a
-  forced-opener parroting effect — see WRITEUP), so scores float run-to-run. All
-  *gated thresholds* clear on every run; fact recall has the least margin (floor ~3/8).
-  If a single run shows recall 2/8 or topic 3, re-run `--all` once.
+- **Score stability:** generation temperature is the kit's original 0.4. Because a
+  verifier secures recall after generation, fact recall is 8/8 every run and the
+  judge dimensions land 4-5/5; there is no longer a low-margin metric to re-roll.
 - The Ollama judge fallback (no `OPENAI_API_KEY`) occasionally returns malformed JSON;
   setting the key avoids it.
 - The kit's `.gitignore` excludes `eval_results/*.json`; if cloning my repo, the

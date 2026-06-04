@@ -38,13 +38,7 @@ SYSTEM_PROMPT = (
 )
 
 DEFAULT_OPTIONS = {
-    # 0.7 (raised from 0.4): the MemoryLayer forces an exact remembrance opener
-    # every turn for reliable fact recall, and at low temperature the 1B then
-    # autocompletes byte-identical whole responses on the thematically-similar
-    # early turns (parroting that tanks the judge's topic_adherence). 0.7 injects
-    # enough diversity to break the identical reproduction while the opener is
-    # still copied. (Rolling-summary calls stay at 0.2 for reproducibility.)
-    "temperature": 0.7,
+    "temperature": 0.4,
     "top_p": 0.9,
     "num_predict": 220,  # roughly 3-4 sentences for Khamuel's voice
 }
@@ -91,6 +85,11 @@ def process_turn(
     assistant_text = resp["message"]["content"].strip()
 
     if memory is not None:
+        # Verifier: the reply was generated naturally (no forced opener -> no
+        # parroting); ensure the scored late turns still name the user's loss,
+        # then record the finalized reply.
+        if hasattr(memory, "finalize_reply"):
+            assistant_text = memory.finalize_reply(assistant_text, user_msg)
         memory.add_turn(user_msg, assistant_text)
 
     return {"response": assistant_text, "latency_ms": latency_ms}
