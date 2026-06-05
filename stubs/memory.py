@@ -32,10 +32,16 @@ always <= 4000 chars; save()/load() are pure JSON.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Optional
 
 import ollama
+
+# Profile extraction backend. Regex (default) is fast + deterministic; the
+# LLM-based extractor (set KHAMUEL_LLM_PROFILE=1) is far more robust to unusual
+# phrasing/jobs/relationships at the cost of one extra model call per turn.
+USE_LLM_PROFILE = os.environ.get("KHAMUEL_LLM_PROFILE") == "1"
 
 # Total per-turn context budget (system block + native hot messages combined).
 MAX_CONTEXT_CHARS = 4000
@@ -110,11 +116,11 @@ _OCC_WORDS = (
     "accountant", "pastor", "manager", "developer", "designer", "writer",
     "social worker", "therapist", "salesperson", "consultant", "analyst",
 )
-_OCC_LIST_RE = re.compile(r"\b(" + "|".join(_OCC_WORDS) + r")\b", re.I)
-_OCC_PHRASE_RE = re.compile(
-    r"\bI(?:'?m| am)\s+an?\s+([a-z][a-z ]{2,24}?)\b(?=[.,!?]| who| and|$)"
-    r"|\bI work as\s+an?\s+([a-z][a-z ]{2,24}?)\b(?=[.,!?]| who| and|$)",
-    re.I,
+# occupation only when stated in FIRST PERSON about oneself, so "talk to our
+# pastor" is NOT taken as the user's job. Known-job list keeps it precise; the
+# LLM extractor (below) handles unusual jobs.
+_OCC_FP_RE = re.compile(
+    r"\bI(?:'?m| am| work as)\s+(?:a |an )?(" + "|".join(_OCC_WORDS) + r")\b", re.I
 )
 
 # Topic classifier: (label, situation phrase, regex). First match wins; crisis first.
@@ -213,13 +219,9 @@ def _extract_profile(profile: dict, user_msg: str) -> None:
             school = _KIDS_SCHOOL_RE.search(user_msg)
             profile["kids"] = f"{k.group(1)} {k.group(2)}" + (f" in {school.group(1)}" if school else "")
     if not profile.get("occupation"):
-        o = _OCC_LIST_RE.search(user_msg)
+        o = _OCC_FP_RE.search(user_msg)
         if o:
             profile["occupation"] = o.group(1).lower()
-        else:
-            op = _OCC_PHRASE_RE.search(user_msg)
-            if op:
-                profile["occupation"] = (op.group(1) or op.group(2)).strip().lower()
 
     # topic: first detected topic STICKS; only crisis can override a prior topic.
     if profile.get("topic") != "crisis":
@@ -237,6 +239,90 @@ def _extract_profile(profile: dict, user_msg: str) -> None:
         pp = _primary_person(profile)
         if pp and pp.get("name"):
             profile["situation"] = f"grieving the loss of their {pp['relation']} {pp['name']}"
+
+
+# ---------------------------------------------------------------------------
+# LLM-based profile extraction (robust alternative to the regex extractor).
+# ---------------------------------------------------------------------------
+
+_PROFILE_PROMPT = (
+    "You maintain a structured profile of a person talking to a Christian pastoral "
+    "chatbot. Given the CURRENT profile (JSON) and the person's NEW message, return "
+    "the UPDATED profile as STRICT JSON only -- no prose. Rules:\n"
+    "- Only record facts the PERSON has clearly stated about themselves; never invent.\n"
+    "- Keep existing facts unless the new message corrects them.\n"
+    "- 'occupation' is the USER'S OWN job, not someone they merely mention "
+    "(e.g. 'talk to our pastor' is NOT the user's job).\n"
+    "- A person is 'deceased' only if the message says they died/passed/were lost.\n"
+    "Schema (use null when unknown):\n"
+    '{"user_name": null, "user_age": null, "occupation": null, "works_fulltime": false, '
+    '"kids": null, "people": [{"relation": "", "name": null, "status": "living", '
+    '"age": null, "cause": null, "when": null, "timeframe": null}], '
+    '"topic": null, "situation": null, "crisis": false}\n'
+    "topic is one of: grief, marriage, addiction, mental_health, faith_doubt, "
+    "parenting, work_finance, crisis, general."
+)
+
+
+def _merge_profile(profile: dict, data: dict) -> None:
+    """Conservatively merge an LLM-returned profile into the live one: only ADD or
+    fill empty fields, never drop a previously-known fact (protects recall)."""
+    profile.setdefault("people", [])
+    for k in ("user_name", "user_age", "occupation", "kids", "topic", "situation"):
+        if data.get(k) and not profile.get(k):
+            profile[k] = data[k]
+    # topic/situation: allow upgrade to crisis, else keep first
+    if data.get("topic") == "crisis":
+        profile["topic"] = "crisis"
+        profile["situation"] = data.get("situation") or profile.get("situation")
+    if data.get("works_fulltime"):
+        profile["works_fulltime"] = True
+    if data.get("crisis"):
+        profile["crisis"] = True
+    for np in data.get("people", []) or []:
+        if not isinstance(np, dict) or not np.get("relation"):
+            continue
+        rel = _norm_relation(np["relation"])
+        ex = _find_person(profile, rel)
+        if ex is None:
+            ex = {"relation": rel, "name": None, "status": "living", "age": None,
+                  "cause": None, "when": None, "timeframe": None}
+            profile["people"].append(ex)
+        for f in ("name", "age", "cause", "when", "timeframe"):
+            if np.get(f) and not ex.get(f):
+                ex[f] = np[f]
+        if np.get("status") == "deceased":
+            ex["status"] = "deceased"
+
+
+def _extract_profile_llm(profile: dict, user_msg: str) -> None:
+    """Update the profile via an LLM call; fall back to regex on any failure."""
+    try:
+        resp = ollama.chat(
+            model=SUMMARY_MODEL,
+            messages=[
+                {"role": "system", "content": _PROFILE_PROMPT},
+                {"role": "user",
+                 "content": f"CURRENT PROFILE:\n{json.dumps(profile)}\n\nNEW MESSAGE:\n{user_msg}"},
+            ],
+            options={"temperature": 0},
+            format="json",
+        )
+        data = json.loads(resp["message"]["content"])
+        if isinstance(data, dict):
+            _merge_profile(profile, data)
+            return
+    except Exception:
+        pass
+    _extract_profile(profile, user_msg)  # deterministic fallback
+
+
+def update_profile(profile: dict, user_msg: str) -> None:
+    """Dispatch to the configured extractor (LLM or regex)."""
+    if USE_LLM_PROFILE:
+        _extract_profile_llm(profile, user_msg)
+    else:
+        _extract_profile(profile, user_msg)
 
 
 def _primary_person(profile: dict) -> Optional[dict]:
@@ -385,7 +471,7 @@ class MemoryLayer:
         self.turns.append({"user": user_msg, "assistant": assistant_msg, "turn_idx": turn_idx})
         self._just_resumed = False
 
-        _extract_profile(self.persona, user_msg)
+        update_profile(self.persona, user_msg)
         if self.journey_state["topic"] is None and self.persona.get("situation"):
             self.journey_state["topic"] = self.persona["situation"]
         self._rebuild_pinned()
