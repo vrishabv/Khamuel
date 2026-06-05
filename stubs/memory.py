@@ -71,6 +71,8 @@ _RELATION_WORDS = (
     "brother", "sister", "friend", "partner", "boss", "grandmother", "grandfather",
     "grandma", "grandpa", "fiance", "fiancee", "girlfriend", "boyfriend", "child",
     "baby", "uncle", "aunt", "cousin", "mentor", "coworker", "colleague",
+    "roommate", "landlord", "neighbor", "niece", "nephew", "stepmother", "stepfather",
+    "godmother", "godfather",
 )
 _RELATION_NORM = {
     "mom": "mother", "mum": "mother", "dad": "father",
@@ -115,6 +117,18 @@ _USER_NAME_RE = re.compile(r"\bmy name is\s+([A-Z][a-z]+)", re.I)
 _FULLTIME_RE = re.compile(r"\b(full[- ]?time|working full)\b", re.I)
 _KIDS_RE = re.compile(r"\b(one|two|three|four|\d+)\s+(kids|children)\b", re.I)
 _KIDS_SCHOOL_RE = re.compile(r"\b(elementary|middle school|high school|kindergarten|toddler|teenage)\b", re.I)
+# Guard against the "Maya has three kids" trap: a kids count governed by a
+# THIRD-PERSON subject (a name or she/he/they + 'has'/'have') belongs to that
+# person, not the user. Keyed on third-person-singular 'has' (vs first-person
+# 'I/we have'), so "two kids in elementary" in a self-description still counts.
+_KIDS_OWNER_RE = re.compile(
+    r"(?:she|he|they|her|his|their|[A-Z][a-z]+)\s+has\s+$|(?:she|he|they)\s+have\s+$",
+    re.I,
+)
+
+
+def _kids_owned_by_other(msg: str, idx: int) -> bool:
+    return bool(_KIDS_OWNER_RE.search(msg[max(0, idx - 30):idx]))
 # occupation: a small word-list OR an explicit "I'm a / I work as a <job>".
 _OCC_WORDS = (
     "project manager", "nurse", "teacher", "engineer", "doctor", "lawyer",
@@ -220,13 +234,15 @@ def _extract_profile(profile: dict, user_msg: str) -> None:
         profile["works_fulltime"] = True
     if not profile.get("kids"):
         k = _KIDS_RE.search(user_msg)
-        if k:
+        if k and not _kids_owned_by_other(user_msg, k.start()):
             school = _KIDS_SCHOOL_RE.search(user_msg)
             profile["kids"] = f"{k.group(1)} {k.group(2)}" + (f" in {school.group(1)}" if school else "")
-    if not profile.get("occupation"):
-        o = _OCC_FP_RE.search(user_msg)
-        if o:
-            profile["occupation"] = o.group(1).lower()
+    # occupation: a regex match comes from the vetted job list and is first-person,
+    # so it OVERRIDES an earlier LLM guess (e.g. a turn-1 "works full-time" that
+    # should yield to a later "I'm a project manager").
+    o = _OCC_FP_RE.search(user_msg)
+    if o:
+        profile["occupation"] = o.group(1).lower()
 
     # topic: first detected topic STICKS; only crisis can override a prior topic.
     if profile.get("topic") != "crisis":
@@ -493,38 +509,112 @@ class MemoryLayer:
         self.turns.append({"user": user_msg, "assistant": assistant_msg, "turn_idx": turn_idx})
         self._just_resumed = False
 
-        _extract_profile(self.persona, user_msg)   # regex, every turn (primary path)
+        if USE_LLM_MEMORY:
+            # Production path: one LLM call/turn fills pinned + key facts + depth +
+            # profile. No regex. On failure, prior memory is kept unchanged.
+            self._update_memory_llm(turn_idx)
+        else:
+            # Legacy regex path (KHAMUEL_MEMORY_LLM=0).
+            _extract_profile(self.persona, user_msg)
+            if self.journey_state["topic"] is None and self.persona.get("situation"):
+                self.journey_state["topic"] = self.persona["situation"]
+            self._rebuild_pinned()
+            for f in extract_key_facts(user_msg):
+                existing = next((k for k in self.key_facts if k["fact"] == f["fact"]), None)
+                if existing:
+                    existing["last_mentioned_turn"] = turn_idx
+                else:
+                    f["last_mentioned_turn"] = turn_idx
+                    self.key_facts.append(f)
+            new_depth = max(self.journey_state["depth_level"], self._depth_for(turn_idx, user_msg))
+            if new_depth != self.journey_state["depth_level"] or self.journey_state["last_milestone"] is None:
+                self.journey_state["depth_level"] = new_depth
+                self.journey_state["last_milestone"] = DEPTH_LABELS[new_depth]
+
+        older = self.turns[: -self.HOT_TURNS] if len(self.turns) > self.HOT_TURNS else []
+        # Rolling summary (progression compression) is a separate concern from the
+        # per-turn memory extraction above; it still runs on the 6-turn cadence. In
+        # LLM-memory mode the profile gap-fill is off (the per-turn call already does it).
+        start_turn = self.HOT_TURNS + 1  # = 7
+        if older and (turn_idx == start_turn or turn_idx % SUMMARY_INTERVAL == 0):
+            gap = LLM_GAP_FILL and not USE_LLM_MEMORY
+            summary, updates = generate_summary_and_profile(
+                older, self.rolling_summary, self.persona, gap_fill=gap)
+            self.rolling_summary = summary
+            if updates:
+                _merge_profile(self.persona, updates)
+                if not USE_LLM_MEMORY:
+                    self._rebuild_pinned()
+
+    def _update_memory_llm(self, turn_idx: int) -> None:
+        """Consolidated per-turn memory update (hybrid).
+
+        PINNED facts use the slot model: regex (deterministic floor, every turn) AND
+        the LLM both fill the persona, then _rebuild_pinned() renders the sentences
+        (Option B -- never raw model prose in the never-evicted block). KEY facts come
+        from the LLM. DEPTH is a HYBRID: the turn-counter is the floor and the LLM can
+        only ratchet it UP (max), so the LLM's failure mode (returning 0) is harmless.
+        If the LLM call fails the regex floor + counter depth still apply.
+        """
+        user_msg = self.turns[-1]["user"] if self.turns else ""
+
+        # Regex floor: precise, deterministic, runs even when the LLM call fails. It
+        # goes FIRST so its high-precision slots win over the LLM on conflict (the
+        # merge below only fills empty slots).
+        _extract_profile(self.persona, user_msg)
+
+        # Turn-counter depth is the deterministic FLOOR. We pass it (and the turn #) to
+        # the LLM so it makes a bounded "has it gone DEEPER than this?" judgment rather
+        # than rating depth from scratch (which it fails at on a small model).
+        baseline = max(0, min(4, max(self.journey_state["depth_level"],
+                                     self._depth_for(turn_idx, user_msg))))
+
+        data = update_memory_llm(self.turns, self.persona,
+                                 self.journey_state["depth_level"],
+                                 turn_idx=turn_idx, baseline_depth=baseline)
+        if data:
+            prof = data.get("profile")
+            if isinstance(prof, dict):
+                _merge_profile(self.persona, prof)  # LLM adds coverage; fill-empty only
+
+        # Render pinned from the (regex + LLM) persona.
         if self.journey_state["topic"] is None and self.persona.get("situation"):
             self.journey_state["topic"] = self.persona["situation"]
         self._rebuild_pinned()
 
+        # Apply the counter floor first, so depth is correct even if the LLM failed.
+        self.journey_state["depth_level"] = baseline
+        self.journey_state["last_milestone"] = DEPTH_LABELS.get(baseline)
+
+        # Key facts: REGEX FLOOR ONLY (deterministic, runs every turn -- even if the
+        # LLM call failed). A small model cannot reliably extract open-ended incidental
+        # details: it emits bare nouns ('recipe') or parrots the prompt's own examples
+        # as if they were data. So we do NOT ask the LLM for key facts. Accumulate
+        # across turns, dedupe, keep the 5 most recently mentioned.
+        seen = {f["fact"].lower(): f for f in self.key_facts}
         for f in extract_key_facts(user_msg):
-            existing = next((k for k in self.key_facts if k["fact"] == f["fact"]), None)
-            if existing:
-                existing["last_mentioned_turn"] = turn_idx
+            k = f["fact"].lower()
+            if k in seen:
+                seen[k]["last_mentioned_turn"] = turn_idx
             else:
-                f["last_mentioned_turn"] = turn_idx
-                self.key_facts.append(f)
+                seen[k] = {**f, "last_mentioned_turn": turn_idx}
+        self.key_facts = sorted(
+            seen.values(), key=lambda f: f.get("last_mentioned_turn", 0), reverse=True)[:5]
 
-        older = self.turns[: -self.HOT_TURNS] if len(self.turns) > self.HOT_TURNS else []
-        # Summary starts at turn 7 (the first turn that ages out of the 6-turn hot
-        # window) and refreshes on the regular cadence after that -- so early context
-        # is never left uncovered. (Not every turn: that would cost an LLM call/turn.)
-        start_turn = self.HOT_TURNS + 1  # = 7
-        if older and (turn_idx == start_turn or turn_idx % SUMMARY_INTERVAL == 0):
-            # One LLM call returns BOTH the summary and (when enabled) profile
-            # gap-fills for facts the regex missed -- no extra model call.
-            summary, updates = generate_summary_and_profile(
-                older, self.rolling_summary, self.persona, gap_fill=LLM_GAP_FILL)
-            self.rolling_summary = summary
-            if updates:
-                _merge_profile(self.persona, updates)  # fills empty slots only
-                self._rebuild_pinned()
+        if not data:
+            return  # LLM failed: regex floor (profile/pinned/key facts/depth) already applied
 
-        new_depth = max(self.journey_state["depth_level"], self._depth_for(turn_idx, user_msg))
-        if new_depth != self.journey_state["depth_level"] or self.journey_state["last_milestone"] is None:
-            self.journey_state["depth_level"] = new_depth
-            self.journey_state["last_milestone"] = DEPTH_LABELS[new_depth]
+        # Hybrid depth: LLM is upside-only -- it can lift depth ABOVE the counter floor,
+        # never below it. The lift is BOUNDED to curb early over-eagerness: no lift in
+        # the first 3 (establishing) turns, and at most ONE rung above the floor after.
+        lvl = data.get("depth_level")
+        llm_depth = int(lvl) if isinstance(lvl, (int, float)) else 0
+        lift_cap = baseline if turn_idx <= 3 else baseline + 1
+        effective = min(llm_depth, lift_cap, 4)
+        if effective > baseline:
+            self.journey_state["depth_level"] = effective
+            self.journey_state["last_milestone"] = (
+                str(data.get("label") or "").strip() or DEPTH_LABELS.get(effective))
 
     def _rebuild_pinned(self) -> None:
         """Render canonical pinned-fact sentences from the generic profile."""
@@ -787,6 +877,85 @@ _SUMMARY_PROFILE_PROMPT = (
     "invent; 'occupation' is the user's OWN job, not someone they mention; mark a person "
     "'deceased' only if they died/passed/were lost; leave unknown fields null."
 )
+
+
+# ---------------------------------------------------------------------------
+# Consolidated LLM memory extractor (hybrid). One call per turn returns:
+#   - profile  -> structured slots; merged with the regex extractor, then
+#                 _rebuild_pinned() renders the PINNED facts (Option B: code writes
+#                 the always-on sentences, never raw model prose);
+#   - key_facts -> specific incidental details (the LLM's real value-add);
+#   - depth_level/label -> journey depth (clamped monotonic).
+# Regex runs every turn as a deterministic floor, so a failed LLM call never empties
+# the pinned block.
+# ---------------------------------------------------------------------------
+
+# Default ON for this branch. Set KHAMUEL_MEMORY_LLM=0 to fall back to the regex path.
+USE_LLM_MEMORY = os.environ.get("KHAMUEL_MEMORY_LLM", "1") != "0"
+
+_MEMORY_PROMPT = (
+    "You maintain the working MEMORY of a Christian pastoral assistant talking with "
+    "ONE person across many turns. Read the PRIOR MEMORY and the NEW exchanges, then "
+    "output the UPDATED memory as STRICT JSON only -- no prose, no markdown. Keep "
+    "prior facts unless the new exchanges correct them; only ADD or REFINE. Record "
+    "ONLY what the PERSON clearly stated about themselves; never invent.\n"
+    "Output EXACTLY these keys:\n"
+    '{"profile": {"user_name": null, "user_age": null, "occupation": null, '
+    '"kids": null, "people": [{"relation": "", "name": null, "status": "living", '
+    '"cause": null, "age": null}], "situation": null, "crisis": false}, '
+    '"depth_level": 0, "label": ""}\n'
+    "profile: durable structured facts. 'occupation' is the user's OWN job, not "
+    "someone they merely mention. status 'deceased' only if they died/passed/were "
+    "lost. crisis true ONLY if the user says they don't want to live or want to harm "
+    "themselves.\n"
+    "depth_level + label: how deep the conversation has gone. You are given a BASELINE "
+    "DEPTH (a floor) in the user message -- NEVER return less than it, and raise it by "
+    "at most ONE rung, only with clear evidence the user has ALREADY moved there:\n"
+    " 0 getting to know the situation\n 1 hearing the story\n"
+    " 2 exploring the hard feelings (the user is actively dwelling in painful emotion, "
+    "NOT merely recalling a memory or sharing a fact)\n"
+    " 3 seeking how faith applies\n"
+    " 4 practical next-steps (the user is asking for concrete actions, plans, or steps)\n"
+    "The opening turns are for establishing the situation and story (rungs 0-1) -- do "
+    "NOT jump ahead. When unsure, return the baseline."
+)
+
+
+def update_memory_llm(turns: list[dict], prior_profile: dict, prior_depth: int,
+                      turn_idx: Optional[int] = None, baseline_depth: int = 0) -> Optional[dict]:
+    """One Ollama call -> parsed memory dict, or None on any failure.
+
+    Sends the prior memory + recent exchanges; the model returns the updated structured
+    profile and journey depth. turn_idx + baseline_depth anchor the depth judgment (the
+    model is told the floor it must not go below). Returns None (caller keeps prior
+    state) if Ollama errors or the JSON is unusable.
+    """
+    recent = turns[-MemoryLayer.HOT_TURNS:] if turns else []
+    convo = "\n".join(f"User: {t['user']}\nKhamuel: {t['assistant'][:240]}" for t in recent)
+    # Only the structured profile + depth are sent: pinned facts are rendered from the
+    # profile (Option B), and key facts are regex-only (the LLM isn't asked for them).
+    prior_mem = {
+        "profile": prior_profile,
+        "depth_level": prior_depth,
+    }
+    anchor = ""
+    if turn_idx is not None:
+        anchor = (f"\n\nCURRENT TURN: {turn_idx}\nBASELINE DEPTH (floor -- never return "
+                  f"less than this; only go higher if the user has clearly moved deeper): "
+                  f"{baseline_depth}")
+    user_content = f"PRIOR MEMORY:\n{json.dumps(prior_mem)}\n\nNEW EXCHANGES:\n{convo}{anchor}"
+    try:
+        resp = ollama.chat(
+            model=SUMMARY_MODEL,
+            messages=[{"role": "system", "content": _MEMORY_PROMPT},
+                      {"role": "user", "content": user_content}],
+            options={"temperature": 0},
+            format="json",
+        )
+        data = json.loads(resp["message"]["content"])
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def generate_summary_and_profile(turns: list[dict], previous_summary: str = "",
