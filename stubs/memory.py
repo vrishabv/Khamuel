@@ -38,10 +38,15 @@ from typing import Optional
 
 import ollama
 
-# Profile extraction backend. Regex (default) is fast + deterministic; the
-# LLM-based extractor (set KHAMUEL_LLM_PROFILE=1) is far more robust to unusual
-# phrasing/jobs/relationships at the cost of one extra model call per turn.
-USE_LLM_PROFILE = os.environ.get("KHAMUEL_LLM_PROFILE") == "1"
+# Profile extraction is HYBRID:
+#   - regex runs EVERY turn (fast, precise, deterministic, free) -- the primary path;
+#   - an LLM "gap-fill" rides the rolling-summary call (every SUMMARY_INTERVAL turns)
+#     to catch facts regex missed (unusual phrasing/jobs/relationships) -- ZERO extra
+#     model calls, since the summary call already happens.
+# The merge fills only EMPTY slots, so regex (high precision) always wins on conflict
+# and the LLM only adds coverage. Set KHAMUEL_NO_GAPFILL=1 for pure-regex (e.g. for a
+# deterministic A/B comparison).
+LLM_GAP_FILL = os.environ.get("KHAMUEL_NO_GAPFILL") != "1"
 
 # Total per-turn context budget (system block + native hot messages combined).
 MAX_CONTEXT_CHARS = 4000
@@ -399,6 +404,23 @@ _RESTART_MARKERS = [
 ]
 
 
+# The small model sometimes leaks its own scaffolding into the reply as a bracketed
+# placeholder, e.g. "stories about [mention a favorite memory]" or "[child's name]".
+# Strip instruction-like bracketed spans (leaves legit brackets like "[KJV]" alone).
+_TEMPLATE_LEAK_RE = re.compile(
+    r"\s*\[[^\]\n]*\b(mention|insert|e\.?g\.?|name|specific|add|choose|example|"
+    r"placeholder|favorite|your|describe)\b[^\]\n]*\]",
+    re.I,
+)
+
+
+def _strip_template_leaks(text: str) -> str:
+    cleaned = _TEMPLATE_LEAK_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)  # tidy space left before punctuation
+    return cleaned.strip()
+
+
 def _strip_reused_restart_markers(reply: str, early_markers: list[str]) -> str:
     if not early_markers:
         return reply
@@ -471,7 +493,7 @@ class MemoryLayer:
         self.turns.append({"user": user_msg, "assistant": assistant_msg, "turn_idx": turn_idx})
         self._just_resumed = False
 
-        update_profile(self.persona, user_msg)
+        _extract_profile(self.persona, user_msg)   # regex, every turn (primary path)
         if self.journey_state["topic"] is None and self.persona.get("situation"):
             self.journey_state["topic"] = self.persona["situation"]
         self._rebuild_pinned()
@@ -484,10 +506,20 @@ class MemoryLayer:
                 f["last_mentioned_turn"] = turn_idx
                 self.key_facts.append(f)
 
-        if turn_idx % SUMMARY_INTERVAL == 0:
-            older = self.turns[: -self.HOT_TURNS] if len(self.turns) > self.HOT_TURNS else []
-            if older:
-                self.rolling_summary = generate_rolling_summary(older, self.rolling_summary)
+        older = self.turns[: -self.HOT_TURNS] if len(self.turns) > self.HOT_TURNS else []
+        # Summary starts at turn 7 (the first turn that ages out of the 6-turn hot
+        # window) and refreshes on the regular cadence after that -- so early context
+        # is never left uncovered. (Not every turn: that would cost an LLM call/turn.)
+        start_turn = self.HOT_TURNS + 1  # = 7
+        if older and (turn_idx == start_turn or turn_idx % SUMMARY_INTERVAL == 0):
+            # One LLM call returns BOTH the summary and (when enabled) profile
+            # gap-fills for facts the regex missed -- no extra model call.
+            summary, updates = generate_summary_and_profile(
+                older, self.rolling_summary, self.persona, gap_fill=LLM_GAP_FILL)
+            self.rolling_summary = summary
+            if updates:
+                _merge_profile(self.persona, updates)  # fills empty slots only
+                self._rebuild_pinned()
 
         new_depth = max(self.journey_state["depth_level"], self._depth_for(turn_idx, user_msg))
         if new_depth != self.journey_state["depth_level"] or self.journey_state["last_milestone"] is None:
@@ -613,6 +645,7 @@ class MemoryLayer:
         late turns (>=13) and on the first reply after a reload, without a forced
         opener. Builds the closer from the profile (no hardcoded 'Sarah')."""
         turn_idx = len(self.turns) + 1
+        reply = _strip_template_leaks(reply)   # remove leaked scaffolding like "[mention ...]"
         if turn_idx >= 17 and len(self.turns) >= 6:
             early_text = " ".join(t["assistant"] for t in self.turns[:6])
             early_markers = [m for m in _RESTART_MARKERS if re.search(m, early_text, re.I)]
@@ -723,15 +756,72 @@ class MemoryLayer:
 # Rolling-summary helper (generic).
 # ---------------------------------------------------------------------------
 
+# The summary tracks the conversation's PROGRESSION -- what's been discussed, what
+# advice/suggestions were already given (so the bot doesn't repeat them), and what's
+# still unresolved. It deliberately does NOT re-describe who the user is -- the pinned
+# facts already carry that. This is the value the pinned facts can't provide.
 _SUMMARY_PROMPT = (
-    "You are condensing a pastoral conversation so it can be remembered. "
-    "Read the exchange and the prior summary (if any), then output STRICT JSON "
-    "only, no prose, with these keys:\n"
-    '{"user_situation": "...", "emotional_state": "...", '
-    '"advice_given": ["..."], "open_questions": ["..."]}\n'
-    "Keep it factual and compact (about 150 words total). Capture who and what the "
-    "user is dealing with, in their own terms."
+    "You are tracking the PROGRESSION of a pastoral conversation so the assistant "
+    "doesn't repeat itself. Read the exchange and the prior summary (if any), then "
+    "output STRICT JSON only, no prose, with these keys:\n"
+    '{"topics_covered": ["..."], "advice_or_suggestions_given": ["..."], '
+    '"open_threads": ["..."]}\n'
+    "Do NOT restate who the user is or their basic facts. Capture only what has been "
+    "DISCUSSED, what was SUGGESTED/ADVISED (so it isn't offered again), and what is "
+    "still UNRESOLVED. Keep it compact (about 120 words)."
 )
+
+# Hybrid prompt: the same progression-summary call ALSO returns profile gap-fills
+# (facts the regex extractor may have missed). Merged conservatively (adds coverage).
+_SUMMARY_PROFILE_PROMPT = (
+    "You are (1) tracking the PROGRESSION of a pastoral conversation and (2) noting any "
+    "clearly-stated facts about the PERSON an automated extractor might have missed. "
+    "Output STRICT JSON only, no prose, with these keys:\n"
+    '{"topics_covered": ["..."], "advice_or_suggestions_given": ["..."], '
+    '"open_threads": ["..."], "profile_updates": {"user_age": null, "occupation": null, '
+    '"kids": null, "people": [{"relation": "", "name": null, "status": "living", '
+    '"cause": null, "age": null}]}}\n'
+    "For the summary: do NOT restate who the user is; capture only what's been DISCUSSED, "
+    "what was already SUGGESTED/ADVISED (so it isn't repeated), and what's UNRESOLVED. "
+    "For profile_updates: only facts the PERSON clearly stated about themselves; never "
+    "invent; 'occupation' is the user's OWN job, not someone they mention; mark a person "
+    "'deceased' only if they died/passed/were lost; leave unknown fields null."
+)
+
+
+def generate_summary_and_profile(turns: list[dict], previous_summary: str = "",
+                                 profile: Optional[dict] = None, gap_fill: bool = True):
+    """One LLM call -> (rolling_summary_text, profile_updates_dict).
+
+    When gap_fill is True the model also returns profile_updates for facts the regex
+    extractor may have missed. Falls back to the deterministic template (and no
+    updates) on any Ollama/JSON failure, so a hiccup never crashes a run.
+    """
+    convo = "\n".join(f"User: {t['user']}\nKhamuel: {t['assistant'][:240]}" for t in turns)
+    parts = []
+    if gap_fill and profile is not None:
+        parts.append(f"KNOWN PROFILE (do not repeat, only add what's missing):\n{json.dumps(profile)}")
+    if previous_summary:
+        parts.append(f"PRIOR SUMMARY:\n{previous_summary}")
+    parts.append(f"EXCHANGES:\n{convo}")
+    user_content = "\n\n".join(parts)
+    prompt = _SUMMARY_PROFILE_PROMPT if gap_fill else _SUMMARY_PROMPT
+    try:
+        resp = ollama.chat(
+            model=SUMMARY_MODEL,
+            messages=[{"role": "system", "content": prompt},
+                      {"role": "user", "content": user_content}],
+            options={"temperature": 0.2},
+            format="json",
+        )
+        data = json.loads(resp["message"]["content"])
+        rendered = _render_summary(data)
+        if not rendered.strip():
+            raise ValueError("empty summary")
+        updates = data.get("profile_updates") or {} if gap_fill else {}
+        return rendered[:SUMMARY_MAX_CHARS], (updates if isinstance(updates, dict) else {})
+    except Exception:
+        return _template_summary(turns, previous_summary), {}
 
 
 def _render_summary(data: dict) -> str:
@@ -752,10 +842,12 @@ def _render_summary(data: dict) -> str:
         else:
             lines.append(f"{label}: {str(value).strip()}")
 
-    add("Situation", data.get("user_situation"))
-    add("Emotional state", data.get("emotional_state"))
-    add("Advice/scripture already given", data.get("advice_given") or data.get("scriptures_or_advice_given"))
-    add("Still open", data.get("open_questions"))
+    # progression-focused (with back-compat for older key names)
+    add("Topics already discussed", data.get("topics_covered"))
+    add("Advice/suggestions already given (do not repeat)",
+        data.get("advice_or_suggestions_given") or data.get("advice_given")
+        or data.get("scriptures_or_advice_given"))
+    add("Still unresolved", data.get("open_threads") or data.get("open_questions"))
     return "\n".join(lines)
 
 
@@ -770,24 +862,5 @@ def _template_summary(turns: list[dict], previous_summary: str) -> str:
 
 
 def generate_rolling_summary(turns: list[dict], previous_summary: str = "") -> str:
-    convo = "\n".join(f"User: {t['user']}\nKhamuel: {t['assistant'][:240]}" for t in turns)
-    user_content = convo
-    if previous_summary:
-        user_content = f"PRIOR SUMMARY:\n{previous_summary}\n\nNEW EXCHANGES:\n{convo}"
-    try:
-        resp = ollama.chat(
-            model=SUMMARY_MODEL,
-            messages=[
-                {"role": "system", "content": _SUMMARY_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            options={"temperature": 0.2},
-            format="json",
-        )
-        data = json.loads(resp["message"]["content"])
-        rendered = _render_summary(data)
-        if not rendered.strip():
-            raise ValueError("empty summary")
-        return rendered[:SUMMARY_MAX_CHARS]
-    except Exception:
-        return _template_summary(turns, previous_summary)
+    """Back-compat wrapper: summary only, no profile gap-fill."""
+    return generate_summary_and_profile(turns, previous_summary, profile=None, gap_fill=False)[0]

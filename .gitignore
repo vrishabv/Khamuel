@@ -19,3 +19,7 @@ _*.log
 _*.ps1
 _*.py
 _*_backup/
+
+# per-turn analysis traces (scratch)
+eval_results/memtrace/
+eval_results/llm_input/
